@@ -1372,9 +1372,66 @@ function renderComparison() {
   renderComparisonRanking($("#compare-rank-a"), compareData.session_a);
   renderComparisonRanking($("#compare-rank-b"), compareData.session_b);
   renderComparisonSummary();
+  renderArbitration();
   renderComparisonTauB();
   renderComparisonFilters();
   renderComparisonDetails();
+}
+
+function renderArbitration() {
+  const s = compareData.summary;
+  $("#arbitration-consensus-num").textContent = s.same;
+  $("#arbitration-divergence-num").textContent = s.different;
+  const btn = $("#compare-arbitrate-btn");
+  // 没有分歧时无需仲裁：禁用按钮（全共识创建新会话没有待评审内容）
+  btn.disabled = s.different === 0;
+  btn.textContent = s.different === 0
+    ? "⚖️ 两轮结果完全一致，无需仲裁"
+    : `⚖️ 确认创建仲裁会话（预填 ${s.same} 对共识，仲裁 ${s.different} 对分歧）并继续评审`;
+}
+
+async function createArbitration() {
+  if (!state || !compareData) return;
+  const s = compareData.summary;
+  if (s.different === 0) return;
+  const other = compareData.session_b.id;
+  if (!confirm(
+    `确认基于这两轮创建分歧仲裁会话吗？\n` +
+    `· 候选沿用当前会话（${shortSid(state.session_id)}…）的启用候选顺序；\n` +
+    `· 自动预填 ${s.same} 对两轮结果相同的共识判断；\n` +
+    `· ${s.different} 对分歧组合保持待评审，由你逐对重新判断。\n\n` +
+    "创建使用单个 SQLite 事务，不会修改两个原会话；当前浏览器将切换到新会话继续评审。"
+  )) {
+    return;
+  }
+  const btn = $("#compare-arbitrate-btn");
+  btn.disabled = true;
+  try {
+    const newState = await api(`/api/sessions/${state.session_id}/arbitration`, {
+      method: "POST",
+      body: JSON.stringify({ other_session_id: other }),
+    });
+    // 创建成功：切换到新会话并跳转继续评审
+    state = newState;
+    localStorage.setItem(STORAGE_KEY, state.session_id);
+    selectedPair = null;
+    focusPair = null;
+    basisSelection = [];
+    basisData = null;
+    compareData = null;
+    closeComparison();
+    stateChanged();
+    toast(
+      `仲裁会话已创建：已预填 ${s.same} 对共识判断，` +
+      `还剩 ${state.pending.length} 对分歧组合待评审`
+    );
+    if (state.current_pair) {
+      $("#current-pair").scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  } catch (e) {
+    toast(e.message);
+    btn.disabled = false;
+  }
 }
 
 async function copyCurrentSessionId() {
@@ -1621,6 +1678,7 @@ $("#compare-open-btn").addEventListener("click", openComparison);
 $("#snapshot-btn").addEventListener("click", downloadSnapshot);
 $("#compare-close").addEventListener("click", closeComparison);
 $("#compare-run-btn").addEventListener("click", runComparison);
+$("#compare-arbitrate-btn").addEventListener("click", createArbitration);
 $("#compare-copy-a").addEventListener("click", copyCurrentSessionId);
 $("#compare-sid-b").addEventListener("keydown", (e) => {
   if (e.key === "Enter") {

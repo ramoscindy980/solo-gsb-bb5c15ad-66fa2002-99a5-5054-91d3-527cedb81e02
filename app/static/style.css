@@ -904,6 +904,24 @@ button.snapshot-entry:hover:not(:disabled) { background: rgba(62, 207, 142, 0.14
 .compare-stat.stat-tie-win .compare-stat-num { color: var(--accent); }
 .compare-stat.stat-different .compare-stat-num { color: var(--red); }
 
+.compare-arbitration {
+  background: var(--bg);
+  border: 1px solid rgba(111, 224, 214, 0.45);
+  border-radius: 12px;
+  padding: 0.9rem 1.1rem;
+}
+.arbitration-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.2rem;
+  font-size: 0.92rem;
+}
+.arbitration-counts strong { font-size: 1.15rem; }
+.arbitration-consensus { color: var(--green); }
+.arbitration-divergence { color: var(--red); }
+.arbitration-hint { margin: 0.6rem 0 0.8rem; font-size: 0.82rem; line-height: 1.6; }
+#compare-arbitrate-btn { width: 100%; }
+
 .compare-taub {
   background: var(--bg);
   border: 1px solid var(--card-border);

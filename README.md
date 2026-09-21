@@ -13,6 +13,10 @@ docker compose up --build
 ```
 
 该命令会自动完成：构建镜像 → 安装依赖 → 启动服务（首次启动时自动创建 SQLite 数据库与表结构）。
+镜像内置 **HEALTHCHECK 健康检查**（每 10 秒用容器内 Python 探测 `http://127.0.0.1:8000/`，
+首次宽限 5 秒），`docker compose ps` 中状态为 `healthy` 即表示服务已就绪可对外访问；
+在更大的 Compose 编排中，其他服务可用
+`depends_on: { decision-desk: { condition: service_healthy } }` 作为**启动依赖**等待本服务就绪。
 
 启动后访问：
 
@@ -30,6 +34,7 @@ docker compose up --build
 | 对外端口 | `8000` | 修改 `docker-compose.yml` 中 `ports` 左侧端口，如 `"9000:8000"` |
 | `DECISION_DB` | `/app/data/decision.db` | 容器内 SQLite 数据库文件路径，在 `docker-compose.yml` 的 `environment` 中调整 |
 | 数据卷 | `decision-data` | 挂载到容器 `/app/data`，用于持久化评审进度 |
+| 健康检查 | 见下方说明 | Dockerfile 内置 `HEALTHCHECK`，compose 中同口径声明；可作为其他容器的启动依赖 |
 
 ## 🖱️ 使用说明
 
@@ -102,6 +107,17 @@ docker compose up --build
     （`评审快照-{会话ID}.json`，端口仍为 `8000`）。快照包含全部候选及停用状态、
     按判断记录顺序的逐对结果、进度、Schulze 排名与循环冲突信息，并附
     `snapshot_sha256` 完整性哈希；生成为纯只读，不影响任何评审数据。
+15. **创建分歧仲裁**：在「🔀 会话对照报告」生成成功后，报告中展示
+    **共识（自动预填）与分歧（待仲裁）的组合数量**，可一键「确认创建仲裁会话」。
+    - 前提与对照报告完全一致：两轮均已完成、且两会话**启用候选名称集合相同**
+      （录入顺序、存储 a/b 方向可以不同）；后端按候选名称归一化对齐两轮组合结果。
+    - 新会话**沿用当前会话的启用候选顺序**（不携带任一侧的停用候选，停用名单为空），
+      只**预填两轮结果相同的判断**（含两轮同为平局）；胜者反转 / 胜负变平局 /
+      平局变胜负等**分歧组合保持待评审**，由仲裁者逐对重新判断。
+    - 创建过程在**单个 SQLite 事务**中完成：生成全新会话 ID 与共识判断行，
+      **不修改两个原会话**的任何数据，任一环节异常即整体回滚；完成后页面自动
+      跳转到新会话继续评审（localStorage 切换为新会话 ID），并提示剩余待仲裁对数。
+    - 两轮结果完全一致（分歧为 0）时按钮自动禁用——没有需要仲裁的组合。
 
 ## 🚀 快速入口
 
@@ -111,6 +127,7 @@ docker compose up --build
 | 网页（评审台 / 情景沙盘 / 会话对照报告 / 评审快照入口） | <http://localhost:8000> |
 | API 文档（Swagger） | <http://localhost:8000/docs> |
 | 会话对照报告 API | `GET /api/sessions/{当前会话ID}/comparison?other_session_id={另一会话ID}` |
+| 创建分歧仲裁 API | `POST /api/sessions/{当前会话ID}/arbitration`（body: `{"other_session_id":"{另一会话ID}"}`） |
 | 评审快照 API | `GET /api/sessions/{会话ID}/snapshot` |
 
 服务监听容器内 **8000** 端口，默认映射到宿主机 **8000** 端口。
@@ -157,6 +174,29 @@ docker compose up --build
   仅一侧并列（含 `tied_in_a_only` / `tied_in_b_only` 分项）、两侧均并列计数。
 - 接口 `GET /api/sessions/{id}/comparison?other_session_id=...` 为**纯只读**：
   不写库、不改变两会话的任何数据，也不新增数据表或迁移；刷新或关闭弹层无副作用。
+
+## ⚖️ 创建分歧仲裁（单事务派生新会话）
+
+- **入口**：在「🔀 会话对照报告」中成功生成报告后，「逐条判断汇总」下方展示
+  **共识（自动预填）/ 分歧（待仲裁）数量**，点「确认创建仲裁会话并继续评审」即可
+  （端口仍为 `8000`）。
+- **适用前提**（由后端校验，不满足返回 422/404/409）：另一会话存在且不是自身、
+  两会话启用候选名称集合相同、两轮均已完成——与对照报告完全相同。
+- **归一化与预填口径**：
+  - 后端复用对照报告的归一化（按名称排序的无向组合 ＋ 绝对胜者，平局为 `null`），
+    **不受候选录入顺序及存储 a/b 方向影响**；
+  - 新会话的候选**沿用当前会话（路径中的 `{id}`）的启用候选顺序**，不携带任一侧的
+    停用候选，停用名单为空；
+  - 仅**预填两轮结果相同的组合**（同一胜者，或两轮同为平局）；结果不同的组合
+    （`winner_reversed` / `win_to_tie` / `tie_to_win`）一律不预填，保持待评审，
+    由仲裁者在新会中逐对判断。
+- **事务与隔离**：`POST /api/sessions/{id}/arbitration`（body:
+  `{"other_session_id": "..."}`）在**单个 SQLite 事务**内：重新校验前提 → 生成
+  全新 12 位会话 ID → INSERT 新会话行 → 批量 INSERT 共识判断行。**不修改两个原会话**
+  的候选、停用名单、判断记录与沙盘草稿；任一环节异常即整体回滚。成功返回 `201` 与
+  新会话的**完整状态**（同 `GET /api/sessions/{id}`），前端据此直接切换到新会话继续
+  评审（`localStorage` 更新为新会话 ID，原会话可随时通过其 ID 重新打开）。
+- 两轮完全一致（分歧数为 0）时前端禁用创建按钮：没有需要仲裁的内容。
 
 ## 📦 评审快照（可校验归档）
 
@@ -277,6 +317,7 @@ Schulze 最强路径法：路径强度为路径上最弱一环，最强路径取
 | POST | `/api/sessions` | 创建评审会话（body: `{"candidates": [...]}`） |
 | GET | `/api/sessions/{id}` | 获取完整状态（进度、当前对、排名、矩阵、待比较组合、循环冲突、最少改判建议、下一对推荐、停用名单、`has_sandbox` 草稿标记） |
 | GET | `/api/sessions/{id}/comparison?other_session_id=X` | 「会话对照报告」：仅当两会话启用候选名称集合相同且均已完成时，返回逐条判断四类差异统计/明细与两轮最终排名的 Kendall τ-b（分母为 0 时 `value=null`）；纯只读，不修改任一会话 |
+| POST | `/api/sessions/{id}/arbitration` | 「创建分歧仲裁」：body `{"other_session_id":"X"}`，前提同对照报告；单事务生成新会话（沿用当前会话启用候选顺序），只预填两轮结果相同的判断（共识含平局），分歧组合待评审；不修改两个原会话，返回 `201` 与新会话完整状态 |
 | GET | `/api/sessions/{id}/ranking-basis?a=X&b=Y` | 「排名依据」：X/Y 双向最强路径（节点链、各边类型与强度、瓶颈强度、边数）与领先/落后/并列判定；纯只读 |
 | GET | `/api/sessions/{id}/snapshot` | 「评审快照」：返回 `{"payload", "snapshot_sha256"}`——payload 含全部候选与停用名单、按判断记录顺序的逐对结果、进度、Schulze 排名与冲突信息，按固定字段顺序、UTF-8 无空白规范序列化并附 SHA-256；纯只读 |
 | POST | `/api/sessions/{id}/judgments` | 记录判断（body: `{"a","b","result": "a"\|"b"\|"tie"}`）；接受当前对或任意待比较组合（用于推荐跳转） |
@@ -300,7 +341,7 @@ Schulze 最强路径法：路径强度为路径上最弱一环，最强路径取
 │   ├── paths.py         # 排名依据：双向最强路径重建（Floyd + 层序 BFS 稳定决胜）
 │   ├── conflict.py      # 严格胜负图中的最短有向环检测
 │   ├── priority.py      # 下一对优先级推荐（三结果模拟 + 影响分）
-│   ├── compare.py       # 会话对照报告：判断归一化、四类差异、含并列修正 Kendall τ-b
+│   ├── compare.py       # 会话对照报告：判断归一化、四类差异、含并列修正 Kendall τ-b、共识组合提取（仲裁预填）
 │   ├── snapshot.py      # 评审快照：固定字段顺序组装 + UTF-8 无空白规范序列化 + SHA-256
 │   └── static/          # 前端（index.html / style.css / app.js）
 ├── requirements.txt

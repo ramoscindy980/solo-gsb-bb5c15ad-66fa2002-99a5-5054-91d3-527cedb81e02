@@ -8,6 +8,14 @@ services:
       DECISION_DB: /app/data/decision.db   # SQLite 数据库文件路径
     volumes:
       - decision-data:/app/data            # 持久化评审进度
+    # 启动依赖/就绪探测：HTTP 可访问后才标记 healthy，供编排中其他服务用
+    # depends_on: condition: service_healthy 等待本服务就绪（与 Dockerfile 中 HEALTHCHECK 同口径）
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/', timeout=2).status == 200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 5
     restart: unless-stopped
 
 volumes:

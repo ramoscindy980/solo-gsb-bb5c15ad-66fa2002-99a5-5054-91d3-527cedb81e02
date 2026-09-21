@@ -221,3 +221,42 @@ def build_comparison(
         "kendall_tau_b": kendall_tau_b(names, groups_a, groups_b),
         "details": details,
     }
+
+
+def consensus_judgments(
+    base_order: list[str],
+    history_a: list[dict],
+    history_b: list[dict],
+) -> list[dict]:
+    """两轮结果一致（共识）的组合，按**指定候选顺序**重新换算为判断记录。
+
+    用于创建分歧仲裁会话：只预填两轮归一化结果相同的判断；两轮结果不同
+    的组合（胜者反转 / 胜负变平局 / 平局变胜负）一律不返回，留作待评审。
+
+    - 两轮历史均先经 :func:`normalized_verdicts` 归一化为「名称序无向组合
+      → 绝对胜者」，故对齐不受任一论候选录入顺序或存储 a/b 方向影响；
+    - ``base_order`` 为新会话采用的候选顺序（当前会话的启用候选顺序），
+      返回的每条记录按该顺序存储 (a, b)，``result`` 相对存储顺序的 a
+      解释（与 judgments 表口径一致，可直接 INSERT）；
+    - 返回顺序同样按 ``base_order`` 的两两组合序排列，使新会话的判断
+      记录 id 顺序与评审展示顺序稳定一致。
+    """
+    verdicts_a = normalized_verdicts(history_a)
+    verdicts_b = normalized_verdicts(history_b)
+    order = {name: i for i, name in enumerate(base_order)}
+
+    agreed: list[dict] = []
+    for x, y in combinations(base_order, 2):
+        lo, hi = (x, y) if x <= y else (y, x)
+        # 前提校验已保证两轮均完成：每个名称序组合在两轮中都有判断。
+        # 注意必须用 in 区分「平局（键存在、胜者为 None）」与「组合缺失
+        # （键不存在）」，否则共识平局会被误判为分歧而漏预填。
+        if (lo, hi) not in verdicts_a or (lo, hi) not in verdicts_b:
+            continue
+        winner = verdicts_a[(lo, hi)]
+        if winner != verdicts_b[(lo, hi)]:
+            continue  # 该组合两轮有分歧，不预填
+        a, b = sorted((lo, hi), key=order.__getitem__)
+        result = "tie" if winner is None else ("a" if winner == a else "b")
+        agreed.append({"a": a, "b": b, "result": result})
+    return agreed

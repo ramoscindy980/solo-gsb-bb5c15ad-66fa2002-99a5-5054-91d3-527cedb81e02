@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .compare import build_comparison, is_complete, normalized_verdicts
+from .compare import build_comparison, consensus_judgments, is_complete, normalized_verdicts
 from .conflict import minimum_tie_resolution, shortest_cycle
 from .paths import pair_explanation
 from .priority import recommend_next_pair
@@ -134,6 +134,10 @@ class SandboxUpsert(BaseModel):
 class SandboxApply(BaseModel):
     # 客户端回传待应用的暂存改动用于一致性校验；缺省时直接采用服务端草稿
     changes: list[SandboxItem] | None = None
+
+
+class ArbitrationCreate(BaseModel):
+    other_session_id: str
 
 
 # ---------- 状态组装 ----------
@@ -947,6 +951,65 @@ def compare_sessions(sid: str, other_session_id: str | None = None):
         return build_comparison(
             sid, candidates_a, history_a, other, candidates_b, history_b
         )
+    finally:
+        conn.close()
+
+
+@app.post("/api/sessions/{sid}/arbitration", status_code=201)
+def create_arbitration(sid: str, payload: ArbitrationCreate):
+    """创建分歧仲裁会话：在两个已完成、启用候选集合相同的会话之上开工。
+
+    后端按候选名称归一化两轮组合结果（与候选录入顺序、存储 a/b 方向均
+    无关），新会话：
+
+    - **候选沿用当前会话（sid）的启用候选及其顺序**——不携带任一侧的
+      停用候选，停用名单为空；
+    - 只**预填两轮结果相同（共识）的判断**；两轮结果不一致的组合
+      （胜者反转 / 胜负变平局 / 平局变胜负）保持待评审，由仲裁者逐对
+      重新判断。
+
+    前提与对照报告一致（不满足时分别返回 422/404/409）：另一会话存在
+    且不是自身、启用候选名称集合相同、两轮均已完成。
+
+    整个创建过程在**单个 SQLite 事务**中完成：生成全新的会话 ID，只
+    INSERT 新会话行与共识判断行，**绝不修改两个原会话**的候选、停用
+    名单、判断记录与沙盘草稿；任一环节异常即整体回滚。提交后返回新
+    会话的完整状态（可直接进入评审）。
+    """
+    other = (payload.other_session_id or "").strip()
+    if not other:
+        raise HTTPException(422, "请输入另一会话 ID")
+    if other == sid:
+        raise HTTPException(422, "另一会话 ID 不能与当前会话相同")
+
+    conn = get_conn()
+    try:
+        with conn:  # 单事务：无异常提交，异常整体回滚
+            if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (other,)).fetchone() is None:
+                raise HTTPException(404, "另一会话不存在或已被删除")
+
+            candidates_a, history_a = _comparison_inputs(conn, sid)
+            candidates_b, history_b = _comparison_inputs(conn, other)
+            if set(candidates_a) != set(candidates_b):
+                raise HTTPException(409, "两会话的启用候选名称集合不一致，无法创建仲裁")
+            if not is_complete(candidates_a, normalized_verdicts(history_a)):
+                raise HTTPException(409, "当前会话尚未完成全部启用候选对的评审，无法创建仲裁")
+            if not is_complete(candidates_b, normalized_verdicts(history_b)):
+                raise HTTPException(409, "另一会话尚未完成全部启用候选对的评审，无法创建仲裁")
+
+            # 归一化对齐两轮结果，只取共识组合；记录按当前会话启用候选顺序存储
+            agreed = consensus_judgments(candidates_a, history_a, history_b)
+
+            new_sid = uuid.uuid4().hex[:12]
+            conn.execute(
+                "INSERT INTO sessions (id, candidates) VALUES (?, ?)",
+                (new_sid, json.dumps(candidates_a, ensure_ascii=False)),
+            )
+            conn.executemany(
+                "INSERT INTO judgments (session_id, a, b, result) VALUES (?, ?, ?, ?)",
+                [(new_sid, h["a"], h["b"], h["result"]) for h in agreed],
+            )
+            return load_state(conn, new_sid)
     finally:
         conn.close()
 

@@ -282,6 +282,21 @@
         <h4 class="compare-section-title">逐条判断汇总</h4>
         <div id="compare-summary" class="compare-summary"></div>
 
+        <h4 class="compare-section-title">⚖️ 创建分歧仲裁</h4>
+        <div id="compare-arbitration" class="compare-arbitration">
+          <div class="arbitration-counts">
+            <span class="arbitration-consensus">共识（自动预填）<strong id="arbitration-consensus-num">0</strong> 对</span>
+            <span class="arbitration-divergence">分歧（待你仲裁）<strong id="arbitration-divergence-num">0</strong> 对</span>
+          </div>
+          <p class="muted arbitration-hint">
+            新会话沿用<strong>当前会话的启用候选顺序</strong>；后端按候选名称归一化两轮结果，
+            仅自动带入两轮判断相同的共识组合（与候选录入顺序、存储 a/b 方向无关），
+            胜者反转 / 胜负变平局 / 平局变胜负等<strong>分歧组合保持待评审</strong>，由你逐对重新仲裁。
+            创建过程使用单个 SQLite 事务，<strong>不会修改两个原会话</strong>，完成后跳转到新会话继续评审。
+          </p>
+          <button id="compare-arbitrate-btn" class="primary" type="button">⚖️ 确认创建仲裁会话并继续评审</button>
+        </div>
+
         <h4 class="compare-section-title">最终排名一致性（Kendall τ-b，含并列修正）</h4>
         <div id="compare-taub" class="compare-taub"></div>
 
