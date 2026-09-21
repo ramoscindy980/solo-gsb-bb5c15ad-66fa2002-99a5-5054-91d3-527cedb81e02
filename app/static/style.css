@@ -988,6 +988,32 @@ table.compare-table th {
 .cmp-tie_to_win { color: var(--accent); border: 1px solid rgba(91, 140, 255, 0.6); }
 #compare-empty { text-align: center; padding: 0.8rem 0; }
 
+/* ---------- 分歧仲裁 ---------- */
+.arbitration-panel {
+  background: var(--bg);
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
+  padding: 0.85rem 1.1rem;
+}
+.arbitration-stats {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0.6rem;
+  max-width: 26rem;
+}
+.arbitration-desc {
+  margin: 0.7rem 0 0;
+  font-size: 0.82rem;
+}
+.arbitration-actions {
+  margin-top: 0.75rem;
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+}
+.arbitration-actions .muted { font-size: 0.82rem; }
+
 @media (max-width: 760px) {
   .compare-rank-grid { grid-template-columns: 1fr; }
   .compare-vs { transform: rotate(90deg); }

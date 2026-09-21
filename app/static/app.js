@@ -1372,9 +1372,65 @@ function renderComparison() {
   renderComparisonRanking($("#compare-rank-a"), compareData.session_a);
   renderComparisonRanking($("#compare-rank-b"), compareData.session_b);
   renderComparisonSummary();
+  renderArbitration();
   renderComparisonTauB();
   renderComparisonFilters();
   renderComparisonDetails();
+}
+
+/* ---------- 分歧仲裁 ---------- */
+
+function renderArbitration() {
+  // 共识 = 两轮结果相同的组合（将预填进仲裁会话）；分歧 = 其余组合（保持待评审）
+  const s = compareData.summary;
+  $("#arbitration-agreed").textContent = s.same;
+  $("#arbitration-disputed").textContent = s.different;
+  const noDispute = s.different === 0;
+  $("#arbitration-create-btn").disabled = noDispute;
+  $("#arbitration-none").classList.toggle("hidden", !noDispute);
+}
+
+async function createArbitration() {
+  if (!state || !compareData) return;
+  const s = compareData.summary;
+  if (s.different === 0) return;
+  const other = compareData.session_b.id;
+  if (!confirm(
+    "确认创建分歧仲裁会话吗？\n" +
+    `· 新会话沿用当前会话的启用候选顺序（${s.total_pairs} 个组合）；\n` +
+    `· 预填 ${s.same} 条两轮结果相同的共识判断；\n` +
+    `· ${s.different} 条分歧组合保持待评审；\n` +
+    "· 两个原会话均不会被修改，创建后自动切换到新会话继续评审。"
+  )) {
+    return;
+  }
+  const btn = $("#arbitration-create-btn");
+  btn.disabled = true;
+  try {
+    const resp = await api(`/api/sessions/${state.session_id}/arbitration`, {
+      method: "POST",
+      body: JSON.stringify({ other_session_id: other }),
+    });
+    // 跳转到新会话继续评审：切换 localStorage 中的会话并渲染新状态
+    localStorage.setItem(STORAGE_KEY, resp.session_id);
+    state = resp;
+    selectedPair = null;
+    focusPair = null;
+    basisSelection = [];
+    basisData = null;
+    basisReq += 1;
+    compareData = null;
+    closeComparison();
+    stateChanged();
+    toast(
+      `仲裁会话已创建：预填共识 ${resp.arbitration.prefilled_pairs} 对，` +
+      `${resp.arbitration.disputed_pairs} 对分歧待评审`
+    );
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function copyCurrentSessionId() {
@@ -1622,6 +1678,7 @@ $("#snapshot-btn").addEventListener("click", downloadSnapshot);
 $("#compare-close").addEventListener("click", closeComparison);
 $("#compare-run-btn").addEventListener("click", runComparison);
 $("#compare-copy-a").addEventListener("click", copyCurrentSessionId);
+$("#arbitration-create-btn").addEventListener("click", createArbitration);
 $("#compare-sid-b").addEventListener("keydown", (e) => {
   if (e.key === "Enter") {
     e.preventDefault();

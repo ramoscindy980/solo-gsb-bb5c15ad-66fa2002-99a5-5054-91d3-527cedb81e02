@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .arbitration import build_arbitration_judgments
 from .compare import build_comparison, is_complete, normalized_verdicts
 from .conflict import minimum_tie_resolution, shortest_cycle
 from .paths import pair_explanation
@@ -134,6 +135,11 @@ class SandboxUpsert(BaseModel):
 class SandboxApply(BaseModel):
     # 客户端回传待应用的暂存改动用于一致性校验；缺省时直接采用服务端草稿
     changes: list[SandboxItem] | None = None
+
+
+class ArbitrationCreate(BaseModel):
+    # 分歧仲裁：与当前会话对照的另一（已完成）会话 ID
+    other_session_id: str
 
 
 # ---------- 状态组装 ----------
@@ -899,6 +905,43 @@ def _comparison_inputs(
     return candidates, history
 
 
+def _completed_pair_inputs(
+    conn: sqlite3.Connection, sid: str, other: str, *, action: str
+) -> tuple[list[str], list[dict], list[str], list[dict]]:
+    """对照报告 / 分歧仲裁共用的前提校验与数据读取。
+
+    前提（不满足时抛出 404/409，调用方保证不写库）：
+    - 另一会话存在；
+    - 两会话的**启用候选名称集合完全相同**（录入顺序可以不同）；
+    - 两轮评审均已完成（启用候选之间每个组合都已有判断）。
+
+    通过校验时返回两会话各自的启用候选（录入序）与仅含启用候选的判断记录。
+    ``action`` 为校验失败时的操作名（如「对照」「创建仲裁会话」）。
+    """
+    if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (other,)).fetchone() is None:
+        raise HTTPException(404, "另一会话不存在或已被删除")
+
+    candidates_a, history_a = _comparison_inputs(conn, sid)
+    candidates_b, history_b = _comparison_inputs(conn, other)
+
+    set_a, set_b = set(candidates_a), set(candidates_b)
+    if set_a != set_b:
+        only_a = sorted(set_a - set_b)
+        only_b = sorted(set_b - set_a)
+        detail_parts = [f"两会话的启用候选名称集合不一致，无法{action}（停用候选不参与对照）"]
+        if only_a:
+            detail_parts.append(f"仅当前会话启用：{ '、'.join(only_a) }")
+        if only_b:
+            detail_parts.append(f"仅另一会话启用：{ '、'.join(only_b) }")
+        raise HTTPException(409, "；".join(detail_parts))
+
+    if not is_complete(candidates_a, normalized_verdicts(history_a)):
+        raise HTTPException(409, f"当前会话尚未完成全部启用候选对的评审，无法{action}")
+    if not is_complete(candidates_b, normalized_verdicts(history_b)):
+        raise HTTPException(409, f"另一会话尚未完成全部启用候选对的评审，无法{action}")
+    return candidates_a, history_a, candidates_b, history_b
+
+
 @app.get("/api/sessions/{sid}/comparison")
 def compare_sessions(sid: str, other_session_id: str | None = None):
     """会话对照报告：把当前会话与另一会话的**已完成两轮评审**逐条对照。
@@ -922,31 +965,76 @@ def compare_sessions(sid: str, other_session_id: str | None = None):
 
     conn = get_conn()
     try:
-        if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (other,)).fetchone() is None:
-            raise HTTPException(404, "另一会话不存在或已被删除")
-
-        candidates_a, history_a = _comparison_inputs(conn, sid)
-        candidates_b, history_b = _comparison_inputs(conn, other)
-
-        set_a, set_b = set(candidates_a), set(candidates_b)
-        if set_a != set_b:
-            only_a = sorted(set_a - set_b)
-            only_b = sorted(set_b - set_a)
-            detail_parts = ["两会话的启用候选名称集合不一致，无法对照（停用候选不参与对照）"]
-            if only_a:
-                detail_parts.append(f"仅当前会话启用：{ '、'.join(only_a) }")
-            if only_b:
-                detail_parts.append(f"仅另一会话启用：{ '、'.join(only_b) }")
-            raise HTTPException(409, "；".join(detail_parts))
-
-        if not is_complete(candidates_a, normalized_verdicts(history_a)):
-            raise HTTPException(409, "当前会话尚未完成全部启用候选对的评审，无法对照")
-        if not is_complete(candidates_b, normalized_verdicts(history_b)):
-            raise HTTPException(409, "另一会话尚未完成全部启用候选对的评审，无法对照")
-
+        candidates_a, history_a, candidates_b, history_b = _completed_pair_inputs(
+            conn, sid, other, action="对照"
+        )
         return build_comparison(
             sid, candidates_a, history_a, other, candidates_b, history_b
         )
+    finally:
+        conn.close()
+
+
+@app.post("/api/sessions/{sid}/arbitration", status_code=201)
+def create_arbitration(sid: str, payload: ArbitrationCreate):
+    """创建分歧仲裁会话：共识判断预填进新会话，分歧组合留待继续评审。
+
+    前提校验与对照报告一致（另一会话存在、启用候选名称集合相同、两轮
+    均已完成，不满足时返回 404/409/422）。两轮组合结果按候选名称归一化
+    对齐（与候选录入顺序、存储 a/b 方向无关）后：
+
+    - 新会话候选沿用**当前会话的启用候选顺序**（停用候选不进入仲裁会话）；
+    - 仅预填两轮结果**相同**的共识判断（同一胜者或同为平局），按新会话
+      候选录入顺序存储，result 相对存储顺序的 a 解释；
+    - 分歧组合一律不预填，在新会话中保持待评审。
+
+    前提校验、新会话与全部预填判断的写入在**单个 SQLite 事务**中完成，
+    任一失败即整体回滚；只新增一个会话，**不修改两个原会话**的候选、
+    停用名单、判断记录与沙盘草稿。返回新会话完整状态，并附
+    ``arbitration``（来源会话、预填共识数、分歧待评审数）供前端提示。
+    """
+    other = payload.other_session_id.strip()
+    if not other:
+        raise HTTPException(422, "请输入另一会话 ID")
+    if other == sid:
+        raise HTTPException(422, "另一会话 ID 不能与当前会话相同")
+
+    conn = get_conn()
+    try:
+        with conn:  # 单事务：前提校验 + 建会话 + 预填共识判断，异常整体回滚
+            candidates_a, history_a, candidates_b, history_b = _completed_pair_inputs(
+                conn, sid, other, action="创建仲裁会话"
+            )
+            judgments, agreed, disputed = build_arbitration_judgments(
+                candidates_a, history_a, history_b
+            )
+
+            # 新会话 ID：与 create_session 同规则，防御性避开主键冲突
+            new_sid = uuid.uuid4().hex[:12]
+            while (
+                conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?", (new_sid,)
+                ).fetchone()
+                is not None
+            ):
+                new_sid = uuid.uuid4().hex[:12]
+            # 只 INSERT 新会话及其预填判断；两个原会话的任何数据均不改动
+            conn.execute(
+                "INSERT INTO sessions (id, candidates) VALUES (?, ?)",
+                (new_sid, json.dumps(candidates_a, ensure_ascii=False)),
+            )
+            for j in judgments:
+                conn.execute(
+                    "INSERT INTO judgments (session_id, a, b, result) VALUES (?, ?, ?, ?)",
+                    (new_sid, j["a"], j["b"], j["result"]),
+                )
+            state = load_state(conn, new_sid)
+            state["arbitration"] = {
+                "source_sessions": [sid, other],
+                "prefilled_pairs": agreed,
+                "disputed_pairs": disputed,
+            }
+            return state
     finally:
         conn.close()
 
